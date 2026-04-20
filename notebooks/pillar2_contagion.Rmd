@@ -1,14 +1,10 @@
 ---
-title:    "Pillar 2 — Operations: Geographic Contagion of Delays"
-author:   "AMS 597 Statistical Computing"
-date:     "`r Sys.Date()`"
+title: 'Pillar 2 — Operations: Geographic Contagion of Delays'
+author: "AMS 597 Statistical Computing"
+date: "`r Sys.Date()`"
 output:
-  html_document:
+  word_document:
     toc: true
-    toc_float: true
-    theme: flatly
-    highlight: tango
-    self_contained: true
 ---
 
 **Question:** Which U.S. airports act as systemic super-spreaders — propagating delays to the next aircraft leg rather than absorbing them?
