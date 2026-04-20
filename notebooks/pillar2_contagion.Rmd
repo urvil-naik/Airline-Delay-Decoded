@@ -1,6 +1,5 @@
 ---
 title:    "Pillar 2 — Operations: Geographic Contagion of Delays"
-subtitle: "Which airports act as super-spreaders that transmit morning delays across the network?"
 author:   "AMS 597 Statistical Computing"
 date:     "`r Sys.Date()`"
 output:
