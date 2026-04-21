@@ -1,0 +1,311 @@
+---
+title:    "Pillar 3 — Strategy: Corporate Favoritism & The Regional Penalty"
+subtitle: "After controlling for hub congestion, do regional carriers pay a structural taxi-out penalty?"
+author:   "AMS 597 Statistical Computing"
+date:     "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+---
+
+**Question:** Accounting for the baseline congestion of each hub airport, what is the true isolated impact of carrier type (Mainline vs. Regional) on taxi-out time?
+
+**Pipeline:** EDA → OLS Baseline → Mixed-Effects Model → Fixed Effects Comparison → Congestion Ranking → Favoritism Test
+
+---
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow); library(tidyverse); library(scales)
+library(lme4);  library(lmerTest)
+library(ggrepel); library(gridExtra)
+
+theme_set(theme_bw(base_size = 12))
+theme_update(panel.grid.minor = element_blank(),
+             plot.title       = element_text(face = "bold", size = 13),
+             plot.subtitle    = element_text(color = "grey40", size = 11))
+
+PALETTE    <- c(Mainline = "#1f77b4", Regional = "#ff7f0e")
+TIME_ORDER <- c("Morning", "Afternoon", "Evening", "Night")
+
+CHARTS <- file.path("..", "charts", "pillar3")
+dir.create(CHARTS, showWarnings = FALSE, recursive = TRUE)
+save_chart <- function(name, w = 13, h = 5)
+  ggsave(file.path(CHARTS, name), width = w, height = h, dpi = 150, bg = "white")
+
+df <- read_parquet(file.path("..", "data", "cleaned_flight_data_2024.parquet")) |>
+  filter(Carrier_Type != "ULCC") |>
+  mutate(Time_Block   = factor(as.character(Time_Block),   levels = TIME_ORDER),
+         Carrier_Type = factor(as.character(Carrier_Type), levels = c("Mainline", "Regional")),
+         DayOfWeek    = factor(DayOfWeek))
+
+cat(sprintf("Total flights : %s\n", format(nrow(df), big.mark = ",")))
+cat(sprintf("Origins       : %d\n",  n_distinct(df$Origin)))
+cat(sprintf("Carrier types : %s\n",  paste(levels(df$Carrier_Type), collapse = ", ")))
+```
+
+---
+
+## Stage 1 — EDA
+
+Raw taxi-out distributions and the gap by time block — before any modelling.
+
+```{r p3_taxiout_dist, fig.width=13, fig.height=5}
+cap99    <- quantile(df$TaxiOut, 0.99, na.rm = TRUE)
+df_plot  <- df |> filter(TaxiOut <= cap99, !is.na(TaxiOut))
+
+taxi_summary <- df |>
+  filter(!is.na(TaxiOut)) |>
+  group_by(Carrier_Type) |>
+  summarise(mean  = mean(TaxiOut),
+            se    = sd(TaxiOut) / sqrt(n()),
+            lower = mean - 1.96 * se,
+            upper = mean + 1.96 * se,
+            .groups = "drop")
+
+p1 <- ggplot(df_plot, aes(TaxiOut, fill = Carrier_Type)) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = PALETTE, name = NULL) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "TaxiOut Distribution by Carrier Type",
+       subtitle = "Capped at 99th percentile",
+       x = "TaxiOut (min)", y = "Count")
+
+p2 <- ggplot(taxi_summary, aes(Carrier_Type, mean, fill = Carrier_Type)) +
+  geom_col(alpha = 0.85, width = 0.5, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15, lwd = 0.8) +
+  geom_text(aes(label = sprintf("%.2f min", mean)),
+            vjust = -0.8, fontface = "bold", size = 4) +
+  scale_fill_manual(values = PALETTE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title    = "Mean TaxiOut by Carrier (95% CI)",
+       subtitle = "Raw gap — not yet controlling for airport congestion",
+       x = NULL, y = "Avg TaxiOut (min)")
+
+grid.arrange(p1, p2, ncol = 2)
+save_chart("p3_taxiout_dist.png")
+
+cat("Raw TaxiOut by carrier:\n")
+taxi_summary |> mutate(across(where(is.double), \(x) round(x, 3))) |> print()
+```
+
+```{r p3_taxiout_timeblock, fig.width=11, fig.height=5}
+tb_summary <- df |>
+  filter(!is.na(TaxiOut), !is.na(Time_Block)) |>
+  group_by(Time_Block, Carrier_Type) |>
+  summarise(mean_taxi = mean(TaxiOut), .groups = "drop")
+
+ggplot(tb_summary, aes(Time_Block, mean_taxi, colour = Carrier_Type, group = Carrier_Type)) +
+  geom_line(lwd = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sprintf("%.1f", mean_taxi)),
+            vjust = -0.8, size = 3.2, fontface = "bold", show.legend = FALSE) +
+  scale_colour_manual(values = PALETTE, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  labs(title    = "Avg TaxiOut by Time Block × Carrier",
+       subtitle = "Does the regional penalty persist across all time blocks?",
+       x = NULL, y = "Avg TaxiOut (min)")
+
+save_chart("p3_taxiout_timeblock.png", w = 11, h = 5)
+```
+
+---
+
+## Stage 2 — OLS Baseline
+
+Simple regression with no airport control — establishes the raw regional penalty before accounting for where flights depart.
+
+```{r ols_baseline}
+df_filtered <- df |> filter(!is.na(TaxiOut), !is.na(Time_Block), !is.na(Distance))
+set.seed(42)
+df_model <- slice_sample(df_filtered, n = min(200000, nrow(df_filtered)))
+
+# Mainline share per airport — used in Stage 6 favoritism test
+mainline_share <- df |>
+  group_by(Origin) |>
+  summarise(mainline_share = mean(Carrier_Type == "Mainline", na.rm = TRUE),
+            .groups = "drop")
+df_model <- df_model |> left_join(mainline_share, by = "Origin")
+
+ols <- lm(TaxiOut ~ Carrier_Type + Time_Block + Distance + DayOfWeek, data = df_model)
+
+cat("OLS — Raw Regional Penalty:\n")
+broom::tidy(ols) |>
+  filter(str_detect(term, "Carrier|Intercept")) |>
+  mutate(across(where(is.double), \(x) round(x, 4))) |>
+  print()
+```
+
+---
+
+## Stage 3 — Mixed-Effects Model
+
+`(1 | Origin)` gives every airport its own baseline taxi-out time, stripping out congestion differences before estimating the carrier effect.
+
+```{r lmer_fit, message=FALSE}
+lmer_fit <- lmer(TaxiOut ~ Carrier_Type + Time_Block + Distance + (1 | Origin),
+                 data = df_model, REML = TRUE)
+
+cat("Mixed-Effects — True Regional Penalty:\n")
+broom.mixed::tidy(lmer_fit, effects = "fixed") |>
+  filter(str_detect(term, "Carrier|Intercept")) |>
+  mutate(across(where(is.double), \(x) round(x, 4))) |>
+  print()
+```
+
+---
+
+## Stage 4 — Fixed Effects Comparison
+
+Side-by-side: how much does the regional penalty shrink once airport congestion is controlled?
+
+```{r p3_fixed_effects, fig.width=11, fig.height=5}
+ols_fe  <- broom::tidy(ols,  conf.int = TRUE) |> mutate(model = "OLS")
+lmer_fe <- broom.mixed::tidy(lmer_fit, effects = "fixed", conf.int = TRUE) |>
+           mutate(model = "Mixed-Effects")
+
+fe_combined <- bind_rows(ols_fe, lmer_fe) |>
+  filter(str_detect(term, "Carrier|Time_Block")) |>
+  mutate(term = str_remove(term, "Carrier_Type|Time_Block"),
+         term = if_else(term == "", "Regional", term))
+
+ggplot(fe_combined, aes(estimate, reorder(term, estimate), colour = model, shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                orientation = "y", width = 0.25, lwd = 0.8,
+                position = position_dodge(0.5)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  scale_colour_manual(values = c(OLS = "#1f77b4", "Mixed-Effects" = "#d62728"), name = NULL) +
+  scale_shape_manual(values  = c(OLS = 16,        "Mixed-Effects" = 17),         name = NULL) +
+  labs(title    = "Fixed Effects: OLS vs Mixed-Effects",
+       subtitle = "Shrinkage in the Regional coefficient = portion explained by airport congestion",
+       x = "Coefficient (minutes of TaxiOut)", y = NULL) +
+  theme(legend.position = "bottom")
+
+save_chart("p3_fixed_effects.png", w = 11, h = 5)
+
+cat("\nRegional penalty — before vs after airport control:\n")
+bind_rows(
+  ols_fe  |> filter(term == "Carrier_TypeRegional") |> select(model, estimate, conf.low, conf.high),
+  lmer_fe |> filter(term == "Carrier_TypeRegional") |> select(model, estimate, conf.low, conf.high)
+) |> mutate(across(where(is.double), \(x) round(x, 3))) |> print()
+```
+
+---
+
+## Stage 5 — Airport Congestion Ranking
+
+Which airports impose the most baseline congestion on all carriers, regardless of carrier type?
+
+```{r p3_random_effects, fig.width=11, fig.height=7}
+re <- ranef(lmer_fit)$Origin |>
+  rownames_to_column("Origin") |>
+  rename(intercept = `(Intercept)`) |>
+  arrange(desc(intercept))
+
+re_plot <- bind_rows(slice_head(re, n = 15), slice_tail(re, n = 15)) |>
+  mutate(Origin    = fct_reorder(Origin, intercept),
+         direction = if_else(intercept > 0, "Above average", "Below average"))
+
+ggplot(re_plot, aes(intercept, Origin, fill = direction)) +
+  geom_col(alpha = 0.85) +
+  geom_vline(xintercept = 0, lwd = 0.6) +
+  geom_text(aes(label = sprintf("%+.1f", intercept),
+                hjust = if_else(intercept > 0, -0.15, 1.15)),
+            size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = c("Above average" = "#d62728", "Below average" = "#2ca02c"),
+                    name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.15, 0.15))) +
+  labs(title    = "Airport Random Intercepts — Baseline Congestion",
+       subtitle = "Top 15 most congested vs bottom 15 least congested",
+       x = "Minutes above/below grand mean TaxiOut", y = NULL) +
+  theme(legend.position = "top")
+
+save_chart("p3_random_effects.png", w = 11, h = 7)
+
+cat("\nTop-10 most congested airports:\n")
+re |> slice_head(n = 10) |> mutate(intercept = round(intercept, 3)) |> print()
+```
+
+---
+
+## Stage 6 — Favoritism Test
+
+The mixed-effects model proves a gap, not favoritism. This test checks whether the regional penalty gets **worse specifically at airports where mainline carriers dominate** — the signature of active prioritization.
+
+```{r lmer_interact, message=FALSE}
+lmer_interact <- lmer(
+  TaxiOut ~ Carrier_Type * mainline_share + Time_Block + Distance + (1 | Origin),
+  data = df_model, REML = TRUE
+)
+
+cat("Interaction: Carrier_Type × Mainline Share:\n")
+broom.mixed::tidy(lmer_interact, effects = "fixed", conf.int = TRUE) |>
+  filter(str_detect(term, "Carrier|mainline")) |>
+  mutate(across(where(is.double), \(x) round(x, 4))) |>
+  print()
+```
+
+```{r p3_favoritism, fig.width=11, fig.height=5}
+# Airport-level gap: Regional minus Mainline avg TaxiOut, at shared airports
+airport_gap <- df |>
+  filter(!is.na(TaxiOut)) |>
+  group_by(Origin, Carrier_Type) |>
+  summarise(mean_taxi = mean(TaxiOut, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = Carrier_Type, values_from = mean_taxi) |>
+  filter(!is.na(Mainline), !is.na(Regional)) |>
+  mutate(gap = Regional - Mainline) |>
+  left_join(mainline_share, by = "Origin")
+
+ggplot(airport_gap, aes(mainline_share, gap)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.6, color = "#1f77b4", size = 2) +
+  geom_smooth(method = "lm", formula = "y ~ x", se = TRUE,
+              color = "#d62728", fill = "#d62728", alpha = 0.15, lwd = 1.2) +
+  geom_text_repel(
+    data = airport_gap |> filter(gap > quantile(gap, 0.92) | mainline_share > 0.90),
+    aes(label = Origin), size = 3.2, fontface = "bold",
+    box.padding = 0.4, max.overlaps = 15
+  ) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(title    = "Regional Taxi-Out Penalty vs Mainline Hub Dominance",
+       subtitle = "Upward slope = penalty grows where mainline carriers dominate",
+       x = "Mainline share of flights at airport", y = "Regional − Mainline TaxiOut gap (min)")
+
+save_chart("p3_favoritism.png", w = 11, h = 5)
+
+cat(sprintf("\nCorrelation (gap ~ mainline_share): r = %.3f\n",
+            cor(airport_gap$gap, airport_gap$mainline_share, use = "complete.obs")))
+```
+
+---
+
+## Summary
+
+```{r summary}
+re_ols      <- broom::tidy(ols) |> filter(term == "Carrier_TypeRegional")
+re_lmer     <- broom.mixed::tidy(lmer_fit,      effects = "fixed") |>
+               filter(term == "Carrier_TypeRegional")
+re_interact <- broom.mixed::tidy(lmer_interact, effects = "fixed") |>
+               filter(term == "Carrier_TypeRegional:mainline_share")
+
+cat("PILLAR 3 — RESULTS SUMMARY\n")
+cat(sprintf("Flights in model      : %s\n", format(nrow(df_model), big.mark = ",")))
+cat(sprintf("Airports (random eff) : %d\n", n_distinct(df_model$Origin)))
+cat(sprintf("\nRaw regional penalty  : +%.3f min  (OLS)\n",            re_ols$estimate))
+cat(sprintf("True regional penalty : +%.3f min  (mixed-effects)\n",    re_lmer$estimate))
+cat(sprintf("Explained by airports :  %.1f%%\n",
+            (1 - re_lmer$estimate / re_ols$estimate) * 100))
+cat(sprintf("\nFavoritism interaction: %.4f  (p = %.4f)\n",
+            re_interact$estimate, re_interact$p.value))
+cat(sprintf("Interpretation        : %s\n",
+            if (re_interact$p.value < 0.05 & re_interact$estimate > 0)
+              "SIGNIFICANT — penalty grows at mainline-dominated hubs"
+            else if (re_interact$p.value < 0.05 & re_interact$estimate < 0)
+              "SIGNIFICANT — penalty shrinks at mainline-dominated hubs"
+            else "NOT SIGNIFICANT — penalty is uniform across hub types"))
+cat(sprintf("\nICC (airport variance) : %.1f%% of total TaxiOut variance\n",
+            as.data.frame(VarCorr(lmer_fit))$vcov[1] /
+            sum(as.data.frame(VarCorr(lmer_fit))$vcov) * 100))
+```
