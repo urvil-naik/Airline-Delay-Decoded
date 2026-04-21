@@ -56,4 +56,4 @@ This project utilizes both Python and R.
 ├── scripts/            # Python and R scripts for data cleaning
 ├── notebooks/          # Jupyter notebooks (Python) and RMarkdown files (R)
 ├── docs/               # Final PDF report and PPT presentation
-└── README.md           # Project documentation
+└── README.md           # Project documentation 
