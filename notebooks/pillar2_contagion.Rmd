@@ -28,6 +28,7 @@ theme_update(panel.grid.minor = element_blank(),
              plot.subtitle    = element_text(color = "grey40", size = 11))
 
 CLUSTER_COLS <- c("Outbreak Hub" = "#d62728", "Average" = "#ff7f0e", "Resilient" = "#2ca02c")
+ROUTE_COLS   <- c("High-Delay"   = "#d62728", "Moderate" = "#ff7f0e", "Low-Delay"  = "#2ca02c")
 TIME_ORDER   <- c("Morning", "Afternoon", "Evening", "Night")
 
 CHARTS <- file.path("..", "charts", "pillar2")
@@ -48,7 +49,52 @@ cat(sprintf("Origin airports: %d\n",  n_distinct(df$Origin)))
 
 ---
 
-## Stage 1 — EDA: System-wide cascade
+## Stage 1 —  Route Clustering
+
+Cluster every OD route by its delay signature to show delays are structured, not random.
+
+```{r route_clustering}
+route_data <- df |>
+  group_by(Origin, Dest) |>
+  summarise(avg_dep_delay = mean(DepDelay, na.rm = TRUE),
+            avg_arr_delay = mean(ArrDelay, na.rm = TRUE),
+            avg_taxi_out  = mean(TaxiOut,  na.rm = TRUE),
+            flight_count  = n(),
+            .groups = "drop") |>
+  filter(flight_count >= 20, avg_dep_delay < 200, avg_arr_delay < 200)
+
+route_scaled <- route_data |>
+  select(avg_dep_delay, avg_arr_delay, avg_taxi_out) |>
+  scale()
+
+set.seed(42)
+km_route  <- kmeans(route_scaled, centers = 3, nstart = 50)
+rank_dep  <- rank(km_route$centers[, 1])
+route_data <- route_data |>
+  mutate(route_cluster = factor(
+    setNames(case_when(rank_dep == 3 ~ "High-Delay",
+                       rank_dep == 1 ~ "Low-Delay",
+                       TRUE          ~ "Moderate"),
+             seq_len(3))[as.character(km_route$cluster)],
+    levels = c("High-Delay", "Moderate", "Low-Delay")))
+
+cat("Route cluster sizes:\n"); print(table(route_data$route_cluster))
+```
+
+```{r p2_route_clusters, fig.width=11, fig.height=5}
+ggplot(route_data, aes(avg_dep_delay, avg_arr_delay, colour = route_cluster)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_colour_manual(values = ROUTE_COLS, name = "Route cluster") +
+  labs(title    = "Route Clusters by Delay Signature",
+       subtitle = "Each point = one OD route",
+       x = "Avg Departure Delay (min)", y = "Avg Arrival Delay (min)")
+
+save_chart("p2_route_clusters.png", w = 11, h = 5)
+```
+
+---
+
+## Stage 2 — System Cascade
 
 ```{r p2_cascade, fig.width=13, fig.height=5}
 cascade <- df |>
@@ -84,23 +130,21 @@ save_chart("p2_cascade.png")
 
 ---
 
-## Stage 2 — Tail-Number Contagion Metrics
+## Stage 3 — Tail-Number Contagion Metrics
 
-Three metrics per airport from consecutive same-aircraft turnarounds (≤ 8 hrs):
+For each airport, track consecutive legs on the same aircraft to compute:
 
-| Metric | What it measures |
-|---|---|
-| **Transmission Rate** | % of delayed arrivals (>15 min) that infect the next departure |
-| **Propagation Slope** | Minutes of dep-delay generated per minute of arr-delay (`lm` slope) |
-| **Propagation Factor** | Mean(next_DepDelay − ArrDelay) — positive = amplifies, negative = absorbs |
+- **Transmission Rate** — % of delayed arrivals that produce a delayed next departure
+- **Propagation Slope** — `lm` slope of next_DepDelay ~ ArrDelay
+- **Propagation Factor** — mean(next_DepDelay − ArrDelay); positive = amplifies, negative = absorbs
 
-```{r stage2_compute}
-fit_slope    <- function(arr, dep) {
+```{r contagion_compute}
+fit_slope   <- function(arr, dep) {
   ok <- !is.na(arr) & !is.na(dep)
   if (sum(ok) < 10) return(NA_real_)
   coef(lm(dep[ok] ~ arr[ok]))[2]
 }
-hhmm_to_min  <- function(t) (t %/% 100L) * 60L + (t %% 100L)
+hhmm_to_min <- function(t) (t %/% 100L) * 60L + (t %% 100L)
 
 turnarounds <- df |>
   filter(!is.na(Tail_Number), Tail_Number != "Unknown", Tail_Number != "") |>
@@ -111,30 +155,41 @@ turnarounds <- df |>
          next_CRSDepTime = lead(CRSDepTime)) |>
   ungroup() |>
   filter(Dest == next_Origin, !is.na(ArrDelay), !is.na(next_DepDelay)) |>
-  mutate(
-    arr_min      = hhmm_to_min(CRSArrTime)      + ArrDelay,
-    dep_next_min = hhmm_to_min(next_CRSDepTime)  + next_DepDelay,
-    dep_next_min = if_else(dep_next_min < arr_min, dep_next_min + 1440L, dep_next_min),
-    turnaround_min = dep_next_min - arr_min
-  ) |>
+  mutate(arr_min        = hhmm_to_min(CRSArrTime)     + ArrDelay,
+         dep_next_min   = hhmm_to_min(next_CRSDepTime) + next_DepDelay,
+         dep_next_min   = if_else(dep_next_min < arr_min, dep_next_min + 1440L, dep_next_min),
+         turnaround_min = dep_next_min - arr_min) |>
   filter(turnaround_min >= 0, turnaround_min <= 480)
 
 tx_stats <- turnarounds |>
   group_by(Origin = Dest) |>
-  summarise(
-    n_turnarounds      = n(),
-    n_exposed          = sum(ArrDelay > 15, na.rm = TRUE),
-    n_infected         = sum(ArrDelay > 15 & next_DepDelay > 15, na.rm = TRUE),
-    transmission_rate  = n_infected / pmax(n_exposed, 1),
-    prop_slope         = fit_slope(ArrDelay, next_DepDelay),
-    propagation_factor = mean(next_DepDelay - ArrDelay, na.rm = TRUE),
-    avg_turnaround     = median(turnaround_min, na.rm = TRUE),
-    .groups = "drop"
-  ) |>
+  summarise(n_turnarounds      = n(),
+            n_exposed          = sum(ArrDelay > 15, na.rm = TRUE),
+            n_infected         = sum(ArrDelay > 15 & next_DepDelay > 15, na.rm = TRUE),
+            transmission_rate  = n_infected / pmax(n_exposed, 1),
+            prop_slope         = fit_slope(ArrDelay, next_DepDelay),
+            propagation_factor = mean(next_DepDelay - ArrDelay, na.rm = TRUE),
+            avg_turnaround     = median(turnaround_min, na.rm = TRUE),
+            .groups = "drop") |>
   filter(n_exposed >= 30)
 
 cat(sprintf("Turnaround events : %s\n", format(nrow(turnarounds), big.mark = ",")))
 cat(sprintf("Airports (≥30 exp): %d\n", nrow(tx_stats)))
+```
+
+```{r route_bridge}
+# Validate route clustering: do aircraft off High-Delay routes have higher transmission rates?
+bridge <- turnarounds |>
+  left_join(route_data |> select(Origin, Dest, route_cluster), by = c("Origin", "Dest")) |>
+  filter(!is.na(route_cluster)) |>
+  group_by(route_cluster) |>
+  summarise(n_exposed  = sum(ArrDelay > 15, na.rm = TRUE),
+            n_infected = sum(ArrDelay > 15 & next_DepDelay > 15, na.rm = TRUE),
+            tx_rate    = n_infected / pmax(n_exposed, 1),
+            .groups    = "drop")
+
+cat("Transmission rate by inbound route cluster:\n")
+bridge |> mutate(tx_rate = percent(tx_rate, 0.1)) |> print()
 ```
 
 ```{r p2_transmission, fig.width=11, fig.height=5}
@@ -145,12 +200,11 @@ label_df <- tx_stats |>
 
 ggplot(tx_stats, aes(x = avg_turnaround, y = transmission_rate, colour = propagation_factor)) +
   geom_point(aes(size = n_turnarounds), alpha = 0.75) +
-  geom_smooth(method = "loess", formula = 'y ~ x', se = TRUE, 
+  geom_smooth(method = "loess", formula = "y ~ x", se = TRUE,
               colour = "grey30", fill = "grey80", linewidth = 1, show.legend = FALSE) +
   geom_text_repel(data = label_df, aes(label = Origin),
                   size = 3.2, fontface = "bold", box.padding = 0.4,
                   max.overlaps = 20, show.legend = FALSE) +
-  
   scale_colour_gradient2(low = "#2166ac", mid = "gold", high = "#d62728", midpoint = 0,
                          name = "Propagation factor\n(+ amplifies / − absorbs)") +
   scale_y_continuous(labels = percent_format()) +
@@ -164,9 +218,9 @@ save_chart("p2_transmission.png", w = 11, h = 5)
 
 ---
 
-## Stage 3 — K-Means Clustering (K = 3)
+## Stage 4 —  Airport Clustering
 
-```{r stage3_features}
+```{r airport_features}
 base_stats <- df |>
   group_by(Origin) |>
   summarise(n_flights = n(), .groups = "drop") |>
@@ -188,7 +242,7 @@ cat(sprintf("Airports in matrix: %d\n", nrow(feat_mat)))
 
 ```{r p2_kselect, fig.width=13, fig.height=5, message=FALSE}
 set.seed(42)
-p_e <- fviz_nbclust(feat_scaled, kmeans, method = "wss",      k.max = 8, linecolor = "#1f77b4") +
+p_e <- fviz_nbclust(feat_scaled, kmeans, method = "wss",       k.max = 8, linecolor = "#1f77b4") +
   labs(title = "Elbow — WSS", x = "K", y = "Within-cluster SS") +
   theme(plot.title = element_text(face = "bold"))
 
@@ -196,18 +250,15 @@ p_s <- fviz_nbclust(feat_scaled, kmeans, method = "silhouette", k.max = 8, linec
   labs(title = "Silhouette Width", x = "K", y = "Avg silhouette") +
   theme(plot.title = element_text(face = "bold"))
 
-combined_plot <- p_e + p_s
-combined_plot
-
+p_e + p_s
 save_chart("p2_kselect.png", w = 12, h = 5)
 ```
 
-```{r stage3_fit}
+```{r airport_fit}
 K_CHOSEN <- 3
 set.seed(42)
 km <- kmeans(feat_scaled, centers = K_CHOSEN, nstart = 50, iter.max = 300)
 
-# Label clusters by transmission_rate centroid rank
 tx_idx    <- which(colnames(feat_scaled) == "transmission_rate")
 rank_tx   <- rank(km$centers[, tx_idx])
 label_map <- setNames(case_when(rank_tx == K_CHOSEN ~ "Outbreak Hub",
@@ -255,7 +306,7 @@ save_chart("p2_cluster_profile.png", w = 11, h = 5)
 
 ---
 
-## Stage 4 — Geographic Contagion Zones
+## Stage 5 — Geographic Contagion Zones
 
 ```{r p2_geo_map, fig.width=14, fig.height=8}
 coords <- nycflights13::airports |>
@@ -291,7 +342,7 @@ save_chart("p2_geo_map.png", w = 14, h = 8)
 
 ---
 
-## Stage 5 — Network Contagion Map
+## Stage 6 — Network Contagion Map
 
 ```{r p2_network, fig.width=10, fig.height=8}
 clust_lookup  <- airport_feats |> select(Origin, cluster)
@@ -312,9 +363,7 @@ cluster_nodes <- airport_feats |>
             .groups = "drop")
 
 g <- graph_from_data_frame(cluster_edges, vertices = cluster_nodes, directed = TRUE)
-
-V(g)$label <- paste0(V(g)$name,
-                     "\n", V(g)$n_airports, " airports",
+V(g)$label <- paste0(V(g)$name, "\n", V(g)$n_airports, " airports",
                      "\nTx: ", percent(V(g)$avg_tx_rate, 0.1),
                      "  PF: ", round(V(g)$avg_pf, 1), " min")
 
@@ -352,10 +401,8 @@ cat(sprintf("Airports analysed : %d  (≥200 flights, ≥30 exposures)\n", nrow(
 cat(sprintf("Turnaround events : %s\n", format(nrow(turnarounds), big.mark = ",")))
 cat(sprintf("K-Means K         : %d\n\n", K_CHOSEN))
 cat(sprintf("Top super-spreader: %s  (Tx=%.1f%%  Slope=%.3f  PF=%.1f min)\n\n",
-            top_tx$Origin,
-            top_tx$transmission_rate * 100,
-            top_tx$prop_slope,
-            top_tx$propagation_factor))
+            top_tx$Origin, top_tx$transmission_rate * 100,
+            top_tx$prop_slope, top_tx$propagation_factor))
 
 airport_feats |>
   group_by(cluster) |>
