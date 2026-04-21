@@ -14,16 +14,20 @@ Using **~3.5 million domestic flight records** (Jan, Feb, Jun, Jul, Sep, Oct 202
 
 ## Pillar 1 — Economics: The Make-Up Time Phenomenon
 
+**What:** When a flight departs late, can the airline recover that lost time in the air — and what determines whether it can?
+
 **How:** Engineered `Make_Up_Time = DepDelay − ArrDelay` for delayed flights. Applied Random Forest + SHAP to identify what drives in-air recovery. LOWESS confirmed a nonlinear threshold effect before modelling.
 
 - 70.9% of delayed flights recover some time in the air
-- Mainline carriers recover **5.20 min** vs **2.83 min** for regional — a 2.36 min gap per delayed leg
-- Departure delay size is the strongest driver; recovery kicks in sharply beyond ~30 min delays
-- Random Forest: R² = 0.026, RMSE = 16.3 min
+- Mainline carriers recover **5.20 min** vs **2.83 min** for regional - a 2.36 min gap per delayed leg
+- Departure delay size is the strongest driver; recovery kicks in sharply beyond ~150 min delays
+- Random Forest: R² = 0.026, RMSE = 16.3 min the low R² - reflects inherent noise in recovery behavior
 
 ---
 
 ## Pillar 2 — Operations: Geographic Contagion of Delays
+
+**What:** Do delays spread through the network in a structured way, and which airports act as the primary transmission hubs?
 
 **How:** Clustered OD routes by delay signature (K-Means, K=3) to show delays are structured. Then used tail-number logic to track consecutive legs on the same aircraft, computing Transmission Rate, Propagation Slope, and Propagation Factor per airport. Airports clustered into three tiers.
 
@@ -35,6 +39,8 @@ Using **~3.5 million domestic flight records** (Jan, Feb, Jun, Jul, Sep, Oct 202
 ---
 
 ## Pillar 3 — Strategy: Corporate Favoritism & The Regional Penalty
+
+**What:** After accounting for the fact that some airports are simply more congested than others, do regional carriers face a longer taxi-out time than mainline carriers at the same hubs?
 
 **How:** OLS baseline → mixed-effects model `lmer` with `(1 | Origin)` to absorb airport-level congestion → interaction test `Carrier_Type × mainline_share` to check whether the penalty concentrates at mainline-dominated hubs.
 
