@@ -8,7 +8,7 @@
 
 ## Overview
 
-Using **~3.5 million domestic flight records** (Jan, Feb, Jun, Jul, Sep, Oct 2024) from the Bureau of Transportation Statistics (~3.4M after cleaning), we decode the hidden business dynamics of U.S. aviation delays across three pillars.
+Using **~3.1 million domestic flight records** (Jan, Feb, Jun, Jul, Sep, Oct 2024) from the Bureau of Transportation Statistics (~3.0M after cleaning), we decode the hidden business dynamics of U.S. aviation delays across three pillars.
 
 ---
 
@@ -57,8 +57,8 @@ Using **~3.5 million domestic flight records** (Jan, Feb, Jun, Jul, Sep, Oct 202
 |---|---|
 | Source | Bureau of Transportation Statistics, U.S. DOT |
 | Months | Jan, Feb, Jun, Jul, Sep, Oct 2024 |
-| Raw records | ~3.5 million |
-| After cleaning | ~3.4 million |
+| Raw records | ~3.1 million |
+| After cleaning | ~3.0 million |
 | Key variables | `DepDelay`, `ArrDelay`, `TaxiOut`, `Distance`, `Origin`, `Dest`, `Tail_Number` |
 | Engineered | `Make_Up_Time`, `Carrier_Type`, `Time_Block`, `Transmission_Rate`, `Propagation_Factor` |
 
